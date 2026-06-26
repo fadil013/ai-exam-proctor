@@ -1,0 +1,38 @@
+# ── Secrets — NEVER commit ───────────────────────────────
+.env
+*.env
+!.env.example
+
+# ── Model weights & runtime (too large / downloaded separately) ──
+*.pt
+*.onnx
+*.wasm
+**/public/ort/
+**/public/*.onnx
+
+# ── Node / Vite ──────────────────────────────────────────
+node_modules/
+**/node_modules/
+.vite/
+**/.vite/
+dist/
+
+# ── Python ───────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# ── Go build artifacts & server output ───────────────────
+*.exe
+*.exe~
+**/incidents/
+*.log
+*.err
+
+# ── Local config ─────────────────────────────────────────
+.claude/
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

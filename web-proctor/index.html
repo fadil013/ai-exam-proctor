@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Proctor Lite — Web</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+
+    <div id="label-strip">
+      <div class="panel-label student-lbl">STUDENT VIEW</div>
+      <div class="panel-label admin-lbl">ADMIN PANEL</div>
+    </div>
+
+    <canvas id="main-canvas" width="1280" height="360"></canvas>
+
+    <div id="banners">
+      <div id="hand-banner"  class="banner hidden">!!!  HAND / WRIST DETECTED  !!!</div>
+      <div id="face-banner"  class="banner face-ban hidden">MULTIPLE FACES DETECTED — CHEATING RISK</div>
+    </div>
+
+    <div id="status-bar">
+      <div id="status-left">
+        <span id="student-text">STUDENT — clean feed</span>
+      </div>
+      <div id="status-center">
+        <span id="fps-text">-- FPS</span>
+        <span id="hint-text">D=debug  C=recalibrate</span>
+      </div>
+      <div id="status-right">
+        <span id="gaze-text" class="status-ok">LOOKING AHEAD</span>
+        <span id="hand-text" class="status-ok">NO HAND</span>
+        <span id="face-text">-- FACES</span>
+      </div>
+    </div>
+
+    <div id="loading-overlay">
+      <div id="loading-box">
+        <div class="spinner"></div>
+        <p id="loading-msg">Initialising…</p>
+        <p id="loading-sub"></p>
+      </div>
+    </div>
+
+    <div id="error-overlay" class="hidden">
+      <div id="error-box">
+        <h2>Error</h2>
+        <p id="error-msg"></p>
+      </div>
+    </div>
+
+  </div>
+
+  <video id="video" autoplay muted playsinline style="display:none"></video>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

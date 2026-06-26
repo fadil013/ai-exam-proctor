@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Proctor AI — Admin Dashboard</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="dashboard">
+
+    <!-- ── Sidebar (icon rail) ───────────────────────────────────────────── -->
+    <aside id="sidebar">
+      <div class="brand-icon" title="Proctor AI">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+      </div>
+
+      <nav class="nav">
+        <a class="nav-item active" title="Live Monitor">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        </a>
+        <a class="nav-item" title="Incidents">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>
+          <span class="nav-badge" id="nav-incident-count">0</span>
+        </a>
+        <a class="nav-item" title="Events">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>
+        </a>
+        <a class="nav-item" title="Candidates">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        </a>
+        <a class="nav-item" title="Settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </a>
+      </nav>
+
+      <div class="sidebar-foot">
+        <span class="pulse-dot" title="Live session"></span>
+      </div>
+    </aside>
+
+    <!-- ── Main ────────────────────────────────────────────────────────── -->
+    <main id="main">
+
+      <!-- Topbar -->
+      <header id="topbar">
+        <div class="topbar-left">
+          <h1>Live Monitoring <span class="sub">— Candidate Session</span></h1>
+          <span class="rec-pill"><span class="pulse-dot"></span> RECORDING</span>
+        </div>
+        <div class="topbar-right">
+          <span class="timer-chip"><span class="pulse-dot"></span><span id="session-timer" class="mono">00:00:00</span></span>
+          <span class="session-id">PA-20231026-B4</span>
+          <span id="clock" class="clock">--:-- --</span>
+          <span id="fps-text" class="fps-chip">-- FPS</span>
+          <button id="end-session-btn" class="end-session-btn" title="End session and generate full report">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9l6 6M15 9l-6 6"/></svg>
+            End Session
+          </button>
+        </div>
+      </header>
+
+      <!-- Content -->
+      <div id="content">
+
+        <!-- Left: feed + stats -->
+        <section class="feed-col">
+          <div class="card feed-card">
+            <div class="card-label">SPLIT-SCREEN</div>
+            <div class="feed-wrap">
+              <canvas id="main-canvas" width="1280" height="360"></canvas>
+              <div id="hand-banner"  class="feed-banner hidden">HAND / WRIST DETECTED</div>
+              <div id="face-banner"  class="feed-banner face-ban hidden">MULTIPLE FACES — CHEATING RISK</div>
+            </div>
+          </div>
+
+          <div class="stat-row">
+            <div class="stat-card">
+              <span class="stat-k">GAZE</span>
+              <span id="gaze-text" class="stat-v status-ok">LOOKING AHEAD</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-k">FACES</span>
+              <span id="face-text" class="stat-v">1 FACE</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-k">HAND</span>
+              <span id="hand-text" class="stat-v status-ok">NO HAND</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-k">STATUS</span>
+              <span id="status-text" class="stat-v stat-mono">MONITORING</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Right: AI report -->
+        <aside class="report-col">
+          <div class="card report-card">
+            <div class="card-head">
+              <div class="card-label">AI CHEATING REPORT</div>
+              <div class="card-head-actions">
+                <button id="report-pdf" class="pdf-btn" title="Download PDF report" disabled>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+                  PDF
+                </button>
+                <button id="report-expand" class="expand-btn" title="Expand full report" disabled>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+                </button>
+              </div>
+            </div>
+            <div id="report-body">
+              <div class="report-empty">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+                <p>No incident selected.</p>
+                <span>The AI report appears here when an incident fires.</span>
+              </div>
+            </div>
+            <div class="report-foot">Generated by <b>Gemini 2.0 Flash / Groq</b></div>
+          </div>
+        </aside>
+
+      </div>
+
+      <!-- Incident strip -->
+      <div id="incident-strip-wrap">
+        <div id="incident-strip"></div>
+        <button id="strip-next" class="strip-arrow" aria-label="scroll">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+        </button>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- Overlays -->
+  <div id="loading-overlay">
+    <div id="loading-box">
+      <div class="spinner"></div>
+      <p id="loading-msg">Initialising…</p>
+      <p id="loading-sub"></p>
+    </div>
+  </div>
+
+  <div id="error-overlay" class="hidden">
+    <div id="error-box">
+      <h2>Error</h2>
+      <p id="error-msg"></p>
+    </div>
+  </div>
+
+  <!-- Full report modal -->
+  <div id="report-modal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2 id="modal-title">Incident Report</h2>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button id="modal-pdf" class="pdf-btn" title="Download PDF">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+            Download PDF
+          </button>
+          <button id="modal-close" class="modal-close" aria-label="close">&times;</button>
+        </div>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <video id="video" autoplay muted playsinline style="display:none"></video>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <script type="module" src="/src/main.js"></script>
+  <script type="module" src="/src/dashboard.js"></script>
+</body>
+</html>
