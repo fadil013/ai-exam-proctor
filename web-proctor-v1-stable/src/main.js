@@ -1,4 +1,4 @@
-import { FaceLandmarker, FaceDetector, HandLandmarker, FilesetResolver } from
+import { FaceLandmarker, FaceDetector, HandLandmarker, ObjectDetector, FilesetResolver } from
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs'
 import { processGaze, drawIris, resetCalibration,
          LI_C,LI_T,LI_R,LI_B,LI_L,
@@ -10,14 +10,44 @@ const PW = 640, PH = 360
 const API_ENDPOINT        = 'http://localhost:8080/incident'
 const CAPTURE_TOTAL       = 6
 const CAPTURE_GAP_MS      = 1000
-const CAPTURE_COOLDOWN_MS = 5000    // 5s between captures
+const CAPTURE_COOLDOWN_MS = 3000    // 3s between captures — an incident can re-trigger 3s after the last (background AI retry + provisional verdicts absorb the extra LLM load)
+
+// ── Layer 1: real-time visible-phone detector (EfficientDet-Lite0, CPU) ─────
+const PHONE_MIN_SCORE   = 0.42   // ObjectDetector confidence to count a "cell phone" (lowered: a phone held in selfie/angled pose often scores 0.4–0.5; same-spot debounce + LLM confirmation keep false positives down)
+const PHONE_STRONG_SCORE = 0.62  // a SINGLE high-confidence sighting is enough to fire — so a phone flashed for <½s (which may only be caught on one detector run) still triggers a capture
+const PHONE_BANNER_HOLD = 1500   // ms to keep the WARNING BANNER after last sighting (text debounce only)
+const PHONE_FIRE_STREAK = 2      // consecutive detections before firing a capture (lower-confidence path)
+const PHONE_SAME_SPOT_TOL  = 0.06    // box-centre within 6% of frame ⇒ the SAME fixed object (e.g. a phone pictured on a poster)
+const PHONE_SAME_SPOT_HOLD = 120000  // ms: once judged, don't re-fire on a phone that never moves — saves LLM quota, kills dashboard spam
+
+// ── Layer 2b: framing manipulation — camera/lid tilted so the torso & hands leave frame ──
+const FRAMING_CHIN_Y     = 0.82   // chin landmark in the bottom 18% ⇒ no room below for shoulders/hands
+const FRAMING_SUSTAIN_MS = 2500   // must persist this long before flagging (ignores brief reaching/adjusting)
+const FRAMING_REARM_MS   = 60000  // don't re-fire a framing capture more often than this
+
+// ── Adaptive phone-detector cadence — guarantees the loop never starves below the FPS floor ──
+const FPS_FLOOR          = 40     // if smoothed FPS dips to/under this, the phone detector backs off (loop is capped at 48, so >40 = healthy)
+
+// ── Layer 2: covert-device detector (phone NOT in frame) ────────────────────
+// A phone in the lap/under the desk has ZERO pixels to detect — it can only be
+// inferred from BEHAVIOUR: a head clearly tilted DOWN (not just eyes glancing at
+// a lower screen) that repeats, or stares for an abnormally long time. We score
+// these episodes over a rolling window and raise a NEEDS-REVIEW flag (never an
+// auto-accusation — we cannot see the device, so a human decides).
+const COVERT_PITCH_DEG   = 30     // head pitched-down beyond this = looking at lap/desk (raised: normal desk/laptop posture tilts the head ~15-20°, which must NOT trigger)
+const COVERT_MIN_EPISODE = 1200   // ms — a sustained down-look, not a glance/flick
+const COVERT_WINDOW_MS   = 30000  // rolling observation window
+const COVERT_MIN_GLANCES = 4      // repeated head-down glances in the window → suspect
+const COVERT_LONG_STARE  = 6000   // one continuous head-down longer than this → suspect
 
 // ── FPS cap ─────────────────────────────────────────────────────────────
-// Cap the loop at ~45 FPS. Running flat-out at 60-70 wastes CPU and triggers
-// thermal throttling (which is what caused the sub-30 crashes). A steady cap
-// keeps it in the 30-45 band with headroom to spare.
-const TARGET_FPS   = 60
-const MIN_FRAME_MS = 1000 / TARGET_FPS   // ~16.7ms — phone detector removed, more headroom
+// 45 FPS is the REQUIRED minimum. Running flat-out at 60-70 wastes CPU and
+// triggers thermal throttling (which is what caused the sub-30 crashes), so we
+// cap — but at 48, not 45: the cap is the loop's AVERAGE, and second-to-second
+// jitter of ±1-2 under a 45 cap reads 43-44 on the counter. 48 keeps the
+// counter at 45+ at all times while still shedding ~20% load vs 60.
+const TARGET_FPS   = 48
+const MIN_FRAME_MS = 1000 / TARGET_FPS   // ~20.8ms
 let   _lastProcessT = 0
 
 // ── DOM ───────────────────────────────────────────────────────────────────
@@ -31,6 +61,9 @@ const handEl      = document.getElementById('hand-text')
 const statusEl    = document.getElementById('status-text')
 const handBanner  = document.getElementById('hand-banner')
 const faceBanner  = document.getElementById('face-banner')
+const phoneBanner = document.getElementById('phone-banner')
+const covertBanner= document.getElementById('covert-banner')
+const framingBanner = document.getElementById('framing-banner')
 const loadOverlay = document.getElementById('loading-overlay')
 const loadMsg     = document.getElementById('loading-msg')
 const loadSub     = document.getElementById('loading-sub')
@@ -41,13 +74,34 @@ const errMsg      = document.getElementById('error-msg')
 let faceLandmarker = null
 let faceDetector   = null
 let handLandmarker = null
+let objectDetector = null    // EfficientDet-Lite0 — real-time phone detection (CPU)
 let fpsAcc = 0, fpsT0 = performance.now()
+let _emaFps = 60   // smoothed FPS — drives the adaptive phone-detector cadence
 let _debug = false
 let _frameN = 0
 let _lastGs         = null
 let _lastDetections = []
 let _lastHands      = { landmarks: [], handedness: [] }
 let _primaryDetIdx  = 0
+
+// ── Phone-detector state (Layer 1) ──────────────────────────────────────────
+let _phoneVisible  = false   // phone seen within the debounce hold
+let _phoneScore    = 0       // confidence of the last sighting
+let _phoneBox      = null    // {originX,originY,width,height} in video px — for drawing
+let _phoneLastSeen = 0       // performance.now() of last sighting
+let _phoneStreak   = 0       // consecutive detector runs that saw a phone
+let _phoneBoxFresh = false   // true ONLY on frames the detector actually saw a phone — drives the box (no ghosting)
+let _lastFiredPhoneCenter = null  // {x,y} normalised centre of the last phone that fired a capture
+let _lastFiredPhoneAt     = 0     // when it fired — for the same-spot re-fire hold
+
+// ── Covert-device state (Layer 2) ───────────────────────────────────────────
+let _downStart      = 0      // when the current continuous head-down episode began (0 = not down)
+let _covertGlances  = []     // timestamps of completed head-down episodes (pruned to the window)
+
+// ── Framing-manipulation state (Layer 2b) ───────────────────────────────────
+let _framingSince   = 0      // when the torso-hidden condition began (0 = torso visible)
+let _framingHidden  = false  // sustained torso-hidden flag (drives the banner + trigger)
+let _framingFiredAt = -FRAMING_REARM_MS   // last framing capture time (re-arm guard); seeded negative so the FIRST tilt can fire immediately
 
 // ── Intruder / face-count state ───────────────────────────────────────────
 let _lastFaceCount   = 1     // total faces in frame (candidate + intruders), set each render
@@ -66,7 +120,163 @@ let _captureCooldownUntil = 0
 let _prevHandCount        = 0
 let _captureAllBBoxes     = []
 let _captureHandPosture   = 'unknown'  // hand posture at the moment trigger fired
-let _lastKnownIntruderBBoxes = []  // persists between frames — fallback when FaceDetector misses
+let _capturePhoneSeen     = false      // real-time detector saw a phone during this capture window
+let _capturePhoneFrames   = []         // per-frame on-device phone state — gives a per-frame table on EVERY incident
+let _lastKnownIntruderBBoxes = []  // fallback when FaceDetector briefly misses a present intruder
+let _lastKnownIntruderAt     = 0   // when it was last set — the fallback EXPIRES so a one-off (even false) intruder box can't blur a phone/notes out of every later capture for the whole session
+
+// ── Layer 1: continuous lightweight signal buffer (the "memory buffer") ─────
+// GOLDEN RULE: detect in layers, but WRITE EVERYTHING into the report. Every
+// processed frame logs its light signals here at ~zero cost — face count, gaze,
+// hand presence, motion, on-device phone hint — while heavy AI (Layer 3) runs
+// only on triggered captures. At End Session this whole buffer is posted to the
+// API and rendered as the report's SESSION OVERVIEW + FRAME TIMELINE, so nothing
+// is discarded — only layered.
+const MOTION_HIGH = 35   // motion score (0-100) above which a frame counts as "high motion"
+const _sig = {
+  t0: 0, tLast: 0, frames: 0,
+  gaze: { AHEAD: 0, LEFT: 0, RIGHT: 0, UP: 0, DOWN: 0, NO_FACE: 0, UNKNOWN: 0 },
+  face: { none: 0, one: 0, multi: 0 },
+  handFrames: 0, phoneFrames: 0,
+  qualityGood: 0, qualityPoor: 0,
+  motionSum: 0, motionMax: 0, motionSamples: 0, motionHigh: 0,
+  events: { phone_detected_realtime: 0, intruder_detected: 0,
+            hand_visible_and_gaze_toward_wrist: 0, covert_device_suspected: 0,
+            framing_torso_hidden: 0 },
+  timeline: [],          // one finalized bucket per wall-clock second
+  _curSec: -1, _bucket: null
+}
+
+// Motion: cheap luminance frame-diff on a 32×18 downscale (576 px — negligible
+// cost). Returns 0-100. This is Layer-1 "motion" — pure arithmetic, no model.
+const _motionCanvas = document.createElement('canvas')
+_motionCanvas.width = 32; _motionCanvas.height = 18
+const _motionCtx = _motionCanvas.getContext('2d', { willReadFrequently: true })
+let _motionPrev = null
+function computeMotion() {
+  try {
+    _motionCtx.drawImage(video, 0, 0, 32, 18)
+    const cur = _motionCtx.getImageData(0, 0, 32, 18).data
+    if (!_motionPrev) { _motionPrev = cur.slice(0); return 0 }
+    let diff = 0
+    for (let i = 0; i < cur.length; i += 4) {
+      const l  = cur[i]        * 0.299 + cur[i + 1]     * 0.587 + cur[i + 2]     * 0.114
+      const lp = _motionPrev[i] * 0.299 + _motionPrev[i + 1] * 0.587 + _motionPrev[i + 2] * 0.114
+      diff += Math.abs(l - lp)
+    }
+    _motionPrev.set(cur)
+    // 576 px × 255 max per-px diff; ×6 gain so ordinary movement reads on the 0-100 scale
+    return Math.min(100, Math.round((diff / (576 * 255)) * 100 * 6))
+  } catch (_) { return 0 }
+}
+
+function _finalizeBucket(b) {
+  let g = 'AHEAD', gm = -1
+  for (const k in b.gaze) if (b.gaze[k] > gm) { gm = b.gaze[k]; g = k }
+  return {
+    sec: b.sec, face: b.faceMax, gaze: g, hand: b.hand,
+    motion: Math.round(b.motionSum / Math.max(1, b.n)), phone: b.phone
+  }
+}
+
+// logSignalFrame records ONE frame's light signals into the buffer. Called every
+// processed frame from the loop — must stay arithmetic-only (no DOM, no model).
+function logSignalFrame(now, gs, motion) {
+  if (_sig.t0 === 0) _sig.t0 = now
+  _sig.tLast = now
+  _sig.frames++
+
+  const dir = (gs && gs.dir) || 'UNKNOWN'
+  _sig.gaze[dir] = (_sig.gaze[dir] || 0) + 1
+
+  const fc = _lastFaceCount
+  if (fc <= 0) _sig.face.none++
+  else if (fc === 1) _sig.face.one++
+  else _sig.face.multi++
+
+  const hand = !!(_lastHands && _lastHands.landmarks && _lastHands.landmarks.length > 0)
+  if (hand) _sig.handFrames++
+  if (_phoneVisible) _sig.phoneFrames++
+
+  // Quality = a frame the detectors could actually trust (calibrated + a face present).
+  const good = !!(gs && gs.calibrated && dir !== 'NO_FACE')
+  if (good) _sig.qualityGood++; else _sig.qualityPoor++
+
+  _sig.motionSum += motion; _sig.motionSamples++
+  if (motion > _sig.motionMax) _sig.motionMax = motion
+  if (motion > MOTION_HIGH) _sig.motionHigh++
+
+  // 1 Hz timeline bucket — the full-truth per-second sample.
+  const sec = Math.floor((now - _sig.t0) / 1000)
+  if (sec !== _sig._curSec) {
+    if (_sig._bucket) _sig.timeline.push(_finalizeBucket(_sig._bucket))
+    _sig._curSec = sec
+    _sig._bucket = { sec, n: 0, faceMax: 0, gaze: {}, hand: false, motionSum: 0, phone: false }
+  }
+  const bk = _sig._bucket
+  bk.n++
+  if (fc > bk.faceMax) bk.faceMax = fc
+  bk.gaze[dir] = (bk.gaze[dir] || 0) + 1
+  if (hand) bk.hand = true
+  bk.motionSum += motion
+  if (_phoneVisible) bk.phone = true
+}
+
+// _bucketRank scores how "interesting" a timeline sample is, so when the emitted
+// timeline is downsampled for long sessions the anomaly (not a bland AHEAD row)
+// survives — nothing suspicious is ever downsampled away.
+function _bucketRank(s) {
+  if (!s) return -1
+  if (s.phone) return 4
+  if (s.face >= 2) return 3
+  if (s.gaze !== 'AHEAD' && s.gaze !== 'UNKNOWN' && s.gaze !== 'NO_FACE') return 2
+  if (s.motion > MOTION_HIGH) return 1
+  return 0
+}
+
+// getSessionSignals finalizes the buffer into the compact summary the report
+// renders. The timeline is adaptively downsampled to ≤180 rows (keeping the most
+// informative sample per window) so a long exam stays legible without dropping
+// any anomaly.
+function getSessionSignals() {
+  if (_sig._bucket) { _sig.timeline.push(_finalizeBucket(_sig._bucket)); _sig._bucket = null; _sig._curSec = -1 }
+  const durationSecs = _sig.t0 ? Math.max(0, Math.round((_sig.tLast - _sig.t0) / 1000)) : 0
+  const avgFps = durationSecs > 0 ? +(_sig.frames / durationSecs).toFixed(1) : 0
+
+  const full = _sig.timeline
+  const step = Math.max(1, Math.ceil(full.length / 180))
+  const tl = []
+  for (let i = 0; i < full.length; i += step) {
+    let pick = full[i]
+    for (let j = i + 1; j < Math.min(i + step, full.length); j++) {
+      if (_bucketRank(full[j]) > _bucketRank(pick)) pick = full[j]
+    }
+    if (pick) tl.push(pick)
+  }
+
+  let evTotal = 0
+  for (const k in _sig.events) evTotal += _sig.events[k]
+
+  return {
+    captured_at: new Date().toISOString(),
+    duration_secs: durationSecs,
+    total_frames: _sig.frames,
+    avg_fps: avgFps,
+    sample_secs: step,
+    gaze: _sig.gaze,
+    face: _sig.face,
+    hand_present_frames: _sig.handFrames,
+    phone_hint_frames: _sig.phoneFrames,
+    quality: { good: _sig.qualityGood, poor: _sig.qualityPoor },
+    motion: {
+      avg: _sig.motionSamples ? +(_sig.motionSum / _sig.motionSamples).toFixed(1) : 0,
+      max: _sig.motionMax, high_frames: _sig.motionHigh
+    },
+    events: { ..._sig.events, total: evTotal },
+    timeline: tl
+  }
+}
+window.__getSessionSignals = getSessionSignals
 
 // ── Keys ──────────────────────────────────────────────────────────────────
 window.addEventListener('keydown', e => {
@@ -83,15 +293,55 @@ function setText(el, txt) { if (el && el._t !== txt) { el.textContent = txt; el.
 function setCls(el, cls)  { if (el && el._c !== cls) { el.className   = cls; el._c = cls } }
 
 // ── Camera ────────────────────────────────────────────────────────────────
+let _camStream   = null    // held so End Session can release the webcam
+let _sessionEnded = false   // once true, the loop stops processing (session is over)
+
 async function initCamera() {
   setLoad('Requesting camera…')
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { width: 1280, height: 720, facingMode: 'user' }, audio: false
   })
+  _camStream = stream
   video.srcObject = stream
   await new Promise(r => { video.onloadedmetadata = r })
   await video.play()
 }
+
+// endSessionCleanup releases the webcam and freezes the feed — called by the
+// dashboard once the session has finalized. The camera light turns OFF and the
+// split-screen shows a clear "SESSION ENDED" state so the candidate knows they
+// are no longer being recorded.
+function endSessionCleanup() {
+  if (_sessionEnded) return
+  _sessionEnded = true
+  try {
+    if (_camStream) { _camStream.getTracks().forEach(t => t.stop()); _camStream = null }
+    if (video) { try { video.pause() } catch (_) {} video.srcObject = null }
+  } catch (_) {}
+  try {
+    const canvas = document.getElementById('main-canvas')
+    const ctx = canvas && canvas.getContext('2d')
+    if (ctx) {
+      ctx.fillStyle = '#0b0f17'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
+      ctx.fillStyle = '#e5e7eb'
+      ctx.textAlign = 'center'
+      ctx.font = '600 28px system-ui, sans-serif'
+      ctx.fillText('SESSION ENDED', canvas.width / 2, canvas.height / 2 - 8)
+      ctx.fillStyle = '#94a3b8'
+      ctx.font = '15px system-ui, sans-serif'
+      ctx.fillText('Camera stopped — recording finished.', canvas.width / 2, canvas.height / 2 + 24)
+    }
+  } catch (_) {}
+  // Reflect it in the top-bar status chips.
+  try {
+    const rec = document.querySelector('.pulse-dot')?.parentElement
+    if (rec) rec.style.opacity = '0.4'
+    const st = document.getElementById('status-text')
+    if (st) { st.textContent = 'ENDED'; st.className = 'stat-v stat-mono' }
+  } catch (_) {}
+}
+window.__endSessionCleanup = endSessionCleanup
 
 // ── MediaPipe init ────────────────────────────────────────────────────────
 async function initModels() {
@@ -126,9 +376,33 @@ async function initModels() {
         delegate: 'CPU'
       },
       runningMode: 'VIDEO',
-      numHands: 2
+      numHands: 2,
+      // Defaults are 0.5 — weak enough that facial features occasionally read as
+      // knuckles. Real hands score 0.8+, so 0.6 sheds phantoms, never real hands.
+      minHandDetectionConfidence: 0.6,
+      minHandPresenceConfidence: 0.6
     })
   ])
+
+  // Phone detector loads LAST and independently. If its model download fails,
+  // core proctoring (gaze / hand / intruder) still runs — phone detection just
+  // no-ops. EfficientDet-Lite0 (~4MB, COCO) on the CPU delegate — no GPU.
+  try {
+    setLoad('Loading phone detector…', 'EfficientDet-Lite0 · CPU')
+    objectDetector = await ObjectDetector.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
+        delegate: 'CPU'
+      },
+      runningMode: 'VIDEO',
+      scoreThreshold: PHONE_MIN_SCORE,
+      maxResults: 8
+    })
+    console.log('[boot] phone detector ready (EfficientDet-Lite0, CPU)')
+  } catch (e) {
+    console.warn('[boot] phone detector failed to load — continuing without it:', e?.message || e)
+    objectDetector = null
+  }
 }
 
 // ── Calibration overlay ───────────────────────────────────────────────────
@@ -220,6 +494,36 @@ function isHandBox(bb, handLandmarks, vW, vH) {
   return false
 }
 
+// ── Phantom-hand filter ─────────────────────────────────────────────────────
+// HandLandmarker occasionally hallucinates a "hand" ON the candidate's face
+// (nose/mouth reads as knuckles). A real hand touching the face always extends
+// beyond it — palm and wrist reach below the chin — so a detection whose 21
+// landmarks sit almost entirely inside the face's own landmark bbox is a false
+// positive. Dropped at the source, so the HAND banner, the stat card, the
+// wrist-look trigger and the hand_posture hint all stay phantom-free.
+function filterPhantomHands(h, faceResult) {
+  const hands = { landmarks: h.landmarks || [], handedness: h.handedness || [] }
+  const lm = faceResult && faceResult.faceLandmarks && faceResult.faceLandmarks[0]
+  if (!lm || hands.landmarks.length === 0) return hands
+  let fL = 1, fR = 0, fT = 1, fB = 0
+  for (const p of lm) {
+    if (p.x < fL) fL = p.x
+    if (p.x > fR) fR = p.x
+    if (p.y < fT) fT = p.y
+    if (p.y > fB) fB = p.y
+  }
+  const keepL = [], keepH = []
+  for (let i = 0; i < hands.landmarks.length; i++) {
+    let inside = 0
+    for (const pt of hands.landmarks[i]) {
+      if (pt.x >= fL && pt.x <= fR && pt.y >= fT && pt.y <= fB) inside++
+    }
+    // A hand-on-chin puts ~8-14 pts in the face box; a phantom puts 20-21.
+    if (inside < 18) { keepL.push(hands.landmarks[i]); keepH.push(hands.handedness[i]) }
+  }
+  return { landmarks: keepL, handedness: keepH }
+}
+
 // ── Real-face validator ─────────────────────────────────────────────────────
 // BlazeFace also fires on phones (the dark camera module looks like a face),
 // which caused false intruders AND blurred the phone out of the LLM collage.
@@ -249,9 +553,11 @@ function isIntruderFace(det, handLandmarks, vW, vH) {
 
 // ── Capture: grab current video frame, pixelate ALL faces ────────────────
 const PIXEL_BLOCK = 8    // mosaic block size
-const FACE_PAD    = 0.10 // 10% padding — tight to the face so it doesn't blur
-                         // notes/phones held right next to the face (was 0.22 and
-                         // spilled onto held objects, making them unidentifiable)
+const FACE_PAD    = 0.06 // small padding — hug the face so the blur never spills
+                         // onto held notes/phones or the surroundings (was 0.22,
+                         // then 0.10). Combined with the ELLIPSE mask in
+                         // pixelateFace, ONLY the face oval is blurred — not the
+                         // rectangle of neck/hair/background around it.
 
 // Convert normalized bbox → padded normalized bbox
 function padBBox(minX, minY, maxX, maxY) {
@@ -302,8 +608,12 @@ function snapshotAllFaceBBoxes() {
     }
   } catch (_) {}
 
-  // If FaceDetector missed them (extreme angle, head down), use last known position
-  bboxes.push(...(currentIntruders.length > 0 ? currentIntruders : _lastKnownIntruderBBoxes))
+  // If FaceDetector missed them (extreme angle, head down), fall back to the last
+  // known position — but ONLY while it is fresh. A stale box (a transient/false
+  // second face that already left) must NOT keep pixelating a region every capture,
+  // or it could blur a real phone/notes out of the frames the LLM sees.
+  const _fallbackFresh = (performance.now() - _lastKnownIntruderAt) < 1500
+  bboxes.push(...(currentIntruders.length > 0 ? currentIntruders : (_fallbackFresh ? _lastKnownIntruderBBoxes : [])))
 
   return bboxes
 }
@@ -323,9 +633,16 @@ function pixelateFace(oc, bbox) {
   const tc = tmp.getContext('2d')
   tc.drawImage(video, minX * vW, minY * vH, (maxX - minX) * vW, (maxY - minY) * vH, 0, 0, tW, tH)
 
+  // Clip the mosaic to an ELLIPSE inscribed in the box so we blur ONLY the face
+  // oval — the rectangular corners (background, neck, hair edges) stay sharp.
+  oc.save()
+  oc.beginPath()
+  oc.ellipse(bx + bw / 2, by + bh / 2, bw / 2, bh / 2, 0, 0, Math.PI * 2)
+  oc.clip()
   oc.imageSmoothingEnabled = false
   oc.drawImage(tmp, 0, 0, tW, tH, bx, by, bw, bh)
   oc.imageSmoothingEnabled = true
+  oc.restore()
 }
 
 // Returns offscreen canvas with pixelated faces — caller encodes to JPEG
@@ -447,6 +764,8 @@ function startCapture() {
   _captureCount      = 0
   _captureAllBBoxes  = []
   _captureMaxFaces   = _lastFaceCount   // seed with the count at trigger moment
+  _capturePhoneSeen  = _phoneVisible    // seed with the phone flag at trigger moment
+  _capturePhoneFrames = []
 
   // Snapshot hand posture at trigger moment
   _captureHandPosture = 'unknown'
@@ -463,6 +782,7 @@ function startCapture() {
 function captureNextFrame() {
   _captureAllBBoxes = snapshotAllFaceBBoxes()   // refresh every frame — intruder may have entered
   if (_lastFaceCount > _captureMaxFaces) _captureMaxFaces = _lastFaceCount   // track peak people in frame
+  if (_phoneVisible) _capturePhoneSeen = true   // phone seen at any point during the capture
   const canvas = captureCanvas()
   const gs  = _lastGs || {}
   const dir = gs.dir || 'UNKNOWN'
@@ -479,6 +799,10 @@ function captureNextFrame() {
   _captureGazeLabels.push(dir)
   _captureGazeData.push(gd)
   _captureFrames.push(canvas.toDataURL('image/jpeg', 0.92)) // high quality — sent to LLM as separate frames; small-object legibility matters
+  // Per-frame on-device phone state from the FRESH detector recency, NOT the 1.5s
+  // banner debounce — otherwise a phone seen only in the previous frame would bleed
+  // its flag onto this (phone-free) frame and mis-stamp that row "phone".
+  _capturePhoneFrames.push(_phoneLastSeen > 0 && (performance.now() - _phoneLastSeen) < CAPTURE_GAP_MS)
   _captureCount++
   console.log(`[capture] frame ${_captureCount}/${CAPTURE_TOTAL} — ${dir}  h:${gd.h}  v:${gd.v}  yaw:${gd.yaw}  pitch:${gd.pitch}`)
 
@@ -505,6 +829,8 @@ async function sendToAPI() {
         gazeLabels:     _captureGazeLabels,
         gazeData:       _captureGazeData,
         timestamp:         new Date().toISOString(),
+        phone_detected:    _capturePhoneSeen,
+        frame_phones:      _capturePhoneFrames,
         hand_posture:      _captureHandPosture,
         face_count:        _captureMaxFaces,
         intruder_detected: _captureMaxFaces >= 2,
@@ -524,6 +850,25 @@ async function sendToAPI() {
     _captureCooldownUntil = performance.now() + CAPTURE_COOLDOWN_MS
     window.__captureBusy  = false   // upload finished — End Session may proceed
   }
+}
+
+// computePrimaryDetIdx returns the index of the detection nearest the candidate's
+// own face (so it is excluded from the intruder logic). It MUST be recomputed
+// against the CURRENT detections each time — BlazeFace ordering is not stable, so
+// a cached index from a previous frame can point at the wrong face (skipping a
+// real intruder or pixelating the candidate).
+function computePrimaryDetIdx(detections, faces, vW, vH) {
+  if (!detections || detections.length === 0 || !faces || faces.length === 0) return 0
+  const fx = faces[0][1].x, fy = faces[0][1].y
+  let minDist = Infinity, idx = 0
+  for (let i = 0; i < detections.length; i++) {
+    const bb = detections[i].boundingBox
+    const cx = (bb.originX + bb.width * 0.5) / vW
+    const cy = (bb.originY + bb.height * 0.5) / vH
+    const d = (cx - fx) * (cx - fx) + (cy - fy) * (cy - fy)
+    if (d < minDist) { minDist = d; idx = i }
+  }
+  return idx
 }
 
 // ── Render ────────────────────────────────────────────────────────────────
@@ -549,18 +894,7 @@ function render(gs, detections, hands, now) {
 
   // ── Intruder boxes — compute + store primary index ───────────────────
   if (detections && detections.length > 0) {
-    let primaryIdx = 0
-    if (faces && faces.length > 0) {
-      const fx = faces[0][1].x, fy = faces[0][1].y
-      let minDist = Infinity
-      for (let i = 0; i < detections.length; i++) {
-        const bb = detections[i].boundingBox
-        const cx = (bb.originX + bb.width*0.5) / vW
-        const cy = (bb.originY + bb.height*0.5) / vH
-        const d = (cx-fx)*(cx-fx) + (cy-fy)*(cy-fy)
-        if (d < minDist) { minDist = d; primaryIdx = i }
-      }
-    }
+    const primaryIdx = computePrimaryDetIdx(detections, faces, vW, vH)
     _primaryDetIdx = primaryIdx   // store for blurredFrame()
 
     ctx.font = 'bold 12px Segoe UI,monospace'
@@ -583,6 +917,21 @@ function render(gs, detections, hands, now) {
     for (let hi = 0; hi < hands.landmarks.length; hi++) {
       drawHand(hands.landmarks[hi], hands.handedness[hi]?.[0]?.displayName || '?')
     }
+  }
+
+  // ── Phone box (real-time detector) ────────────────────────────────────
+  // Draw ONLY on frames the detector actually saw a phone (_phoneBoxFresh). The
+  // banner may hold longer to debounce the text, but the box must never freeze
+  // on a stale position — that "ghost box" trailing reality reads as latency.
+  // FPS-independent: the box clears at the very next detector run.
+  if (_phoneBox && _phoneBoxFresh) {
+    const bx = PW + (_phoneBox.originX / vW) * PW, by = (_phoneBox.originY / vH) * PH
+    const bw = (_phoneBox.width / vW) * PW,        bh = (_phoneBox.height / vH) * PH
+    ctx.strokeStyle = '#dc2626'; ctx.lineWidth = 3
+    ctx.strokeRect(bx, by, bw, bh)
+    ctx.font = 'bold 12px Segoe UI,monospace'
+    ctx.fillStyle = '#dc2626'
+    ctx.fillText(`PHONE ${Math.round(_phoneScore * 100)}%`, bx + 4, Math.max(by - 5, 12))
   }
 
   // ── Capture progress indicator ───────────────────────────────────────
@@ -634,6 +983,9 @@ function render(gs, detections, hands, now) {
 
   handBanner.classList.toggle('hidden', numHands === 0)
   faceBanner.classList.toggle('hidden', numFaces <= 1)
+  phoneBanner?.classList.toggle('hidden', !_phoneVisible)
+  covertBanner?.classList.toggle('hidden', _covertGlances.length < 3)
+  framingBanner?.classList.toggle('hidden', !_framingHidden)
 
   const sTxt = _captureActive
     ? `CAPTURING ${_captureCount}/${CAPTURE_TOTAL}`
@@ -643,7 +995,9 @@ function render(gs, detections, hands, now) {
   fpsAcc++
   const elapsed = now - fpsT0
   if (elapsed >= 1000) {
-    fpsEl.textContent = `${Math.round(fpsAcc * 1000 / elapsed)} FPS`
+    const fps = fpsAcc * 1000 / elapsed
+    _emaFps = _emaFps * 0.6 + fps * 0.4   // smoothed → drives the adaptive detector cadence
+    fpsEl.textContent = `${Math.round(fps)} FPS`
     fpsAcc = 0; fpsT0 = now
   }
 }
@@ -706,11 +1060,107 @@ function isLookingAtHand() {
   return false
 }
 
+// ── Layer 1: run the phone detector (called on a staggered frame) ──────────
+// Picks the highest-confidence "cell phone" detection, drives the banner/box,
+// and tracks a streak so a single fluke frame doesn't fire a capture. The LLM
+// still judges the captured frames — this is an INSTANT corroborating tripwire,
+// not the verdict.
+function runPhoneDetector(now) {
+  if (!objectDetector) return
+  let best = null
+  try {
+    const res = objectDetector.detectForVideo(video, now)
+    for (const d of (res?.detections || [])) {
+      const c = d.categories && d.categories[0]
+      if (!c) continue
+      const name = (c.categoryName || c.displayName || '').toLowerCase()
+      if (!name.includes('phone')) continue          // COCO "cell phone"
+      if (c.score < PHONE_MIN_SCORE) continue
+      if (!best || c.score > best.score) best = { score: c.score, box: d.boundingBox }
+    }
+  } catch (_) { /* detector hiccup — ignore this frame */ }
+
+  if (best) {
+    _phoneVisible  = true
+    _phoneScore    = best.score
+    _phoneBox      = best.box
+    _phoneLastSeen = now
+    _phoneStreak++
+    _phoneBoxFresh = true
+    if (_captureActive) _capturePhoneSeen = true
+  } else {
+    _phoneStreak   = 0
+    _phoneBoxFresh = false   // box clears at the next detector run — never a stale ghost
+    if (now - _phoneLastSeen > PHONE_BANNER_HOLD) { _phoneVisible = false; _phoneBox = null }
+  }
+}
+
+// Normalised centre of the current phone box (for the same-spot debounce).
+function phoneCenterNow() {
+  if (!_phoneBox) return null
+  const vW = video.videoWidth || 1280, vH = video.videoHeight || 720
+  return {
+    x: (_phoneBox.originX + _phoneBox.width  * 0.5) / vW,
+    y: (_phoneBox.originY + _phoneBox.height * 0.5) / vH
+  }
+}
+
+// ── Layer 2: accumulate covert "looking-down-at-a-hidden-device" behaviour ──
+// Keys on HEAD pitch, not eye gaze: glancing at a lower screen is eyes-only with
+// the head upright, whereas reading a lap/desk phone tilts the head clearly down.
+// Counts discrete down-episodes in a rolling window; the loop fires NEEDS-REVIEW
+// when they repeat or one stare runs abnormally long.
+function updateCovert(now) {
+  const gs = _lastGs
+  if (!gs || !gs.calibrated || gs.dir === 'NO_FACE') { _downStart = 0; return }
+  const pitch = typeof gs.pitch === 'number' ? gs.pitch : null
+  const headDown = pitch !== null ? pitch > COVERT_PITCH_DEG : gs.dir === 'DOWN'
+
+  if (headDown) {
+    if (_downStart === 0) _downStart = now
+  } else if (_downStart !== 0) {
+    if (now - _downStart >= COVERT_MIN_EPISODE) _covertGlances.push(now)
+    _downStart = 0
+  }
+  const cutoff = now - COVERT_WINDOW_MS
+  while (_covertGlances.length && _covertGlances[0] < cutoff) _covertGlances.shift()
+}
+
+function covertTriggered(now) {
+  const longStare = _downStart !== 0 && (now - _downStart) >= COVERT_LONG_STARE
+  return _covertGlances.length >= COVERT_MIN_GLANCES || longStare
+}
+
+// ── Layer 2b: framing manipulation — is the torso/hands tilted out of frame? ──
+// Uses the chin landmark (152) FaceLandmarker already produces every frame: if
+// the chin sits in the bottom band there is physically no room below it for the
+// shoulders/hands, i.e. the camera (or laptop lid) was tilted up to hide what's
+// on the lap/desk. Pure arithmetic — zero added model cost.
+function updateFraming(now, faceResult) {
+  const lm   = faceResult && faceResult.faceLandmarks && faceResult.faceLandmarks[0]
+  const chin = lm && lm[152]
+  const torsoHidden = !!chin && chin.y > FRAMING_CHIN_Y
+  if (torsoHidden) {
+    if (_framingSince === 0) _framingSince = now
+    if (now - _framingSince >= FRAMING_SUSTAIN_MS) _framingHidden = true
+  } else {
+    _framingSince  = 0
+    _framingHidden = false
+  }
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────
 function loop(now) {
+  if (_sessionEnded) return        // session finalized — camera released, stop processing
   requestAnimationFrame(loop)   // re-queue FIRST — loop never dies even if below throws
-  if (now - _lastProcessT < MIN_FRAME_MS) return   // FPS cap → steady, no thermal throttle
-  _lastProcessT = now
+  const _dt = now - _lastProcessT
+  if (_dt < MIN_FRAME_MS) return   // FPS cap → steady, no thermal throttle
+  // Carry the timing remainder. A plain `_lastProcessT = now` reset quantizes
+  // the loop to the display's vsync grid — on a 60Hz screen (16.7ms ticks) a
+  // ~21ms budget then skips EVERY OTHER tick, halving the loop to 30 FPS. The
+  // carry lets short and long gaps alternate so the true average IS the cap,
+  // on any refresh rate.
+  _lastProcessT = now - (_dt % MIN_FRAME_MS)
   try {
     _frameN++
 
@@ -720,17 +1170,21 @@ function loop(now) {
 
     if (_frameN % 4 === 1) {
       const h = handLandmarker.detectForVideo(video, now)
-      _lastHands = { landmarks: h.landmarks || [], handedness: h.handedness || [] }
+      _lastHands = filterPhantomHands(h, faceResult)   // drop "hands" hallucinated on the face
     }
 
     if (_frameN % 4 === 3) {
       const d = faceDetector.detectForVideo(video, now)
       _lastDetections = d.detections || []
-      // Cache intruder bboxes — updated every 4th frame so capture frame 1 has fresh data
+      // Cache intruder bboxes — updated every 4th frame so capture frame 1 has fresh data.
+      // Recompute the primary (own-face) index against the FRESH detections — the
+      // cached _primaryDetIdx is from the previous render and BlazeFace ordering is
+      // not stable, so reusing it could skip a real intruder or cache the own face.
       const _vW = video.videoWidth || 1280, _vH = video.videoHeight || 720
+      const _primIdx = computePrimaryDetIdx(_lastDetections, gs.faces, _vW, _vH)
       const _intruders = []
       for (let _i = 0; _i < _lastDetections.length; _i++) {
-        if (_i === _primaryDetIdx) continue
+        if (_i === _primIdx) continue
         try {
           if (isIntruderFace(_lastDetections[_i], _lastHands.landmarks, _vW, _vH)) {
             const _bb = _lastDetections[_i].boundingBox
@@ -739,8 +1193,28 @@ function loop(now) {
           }
         } catch (_) {}
       }
-      if (_intruders.length > 0) _lastKnownIntruderBBoxes = _intruders
+      if (_intruders.length > 0) { _lastKnownIntruderBBoxes = _intruders; _lastKnownIntruderAt = now }
     }
+
+    // Phone detector — staggered to its own frame so no single frame runs two
+    // heavy models. CRITICAL: the stride MUST be a MULTIPLE OF 4 so the offset-2
+    // slot never drifts onto the hand frame (%4===1) or the face-detector frame
+    // (%4===3) — a non-multiple like 45 (45%4===1) would slide across both and
+    // run 3 CPU models on the same frame, spiking latency exactly when FPS is low.
+    // Adaptive cadence: every 24th frame (~0.5s @45fps) when healthy, backing off
+    // to every 44th when FPS dips under the floor — the detector can never be why
+    // FPS drops, and the phone is still caught via the streak + per-frame capture.
+    // Every 12th frame (~267ms @45fps) when healthy — tight enough that a phone
+    // flashed for well under a second is sampled at least twice. Backs off to every
+    // 44th only when FPS dips under the floor, so the detector can never be the cause
+    // of an FPS drop. Stride MUST stay a multiple of 4 (see stagger note above).
+    const phoneStride = _emaFps <= FPS_FLOOR ? 44 : 12
+    if (_frameN % phoneStride === 2) runPhoneDetector(now)
+
+    // Behavioural accumulators — pure arithmetic on already-computed data, run
+    // every frame (zero added model cost).
+    updateCovert(now)
+    updateFraming(now, faceResult)
 
     const curHandCount = _lastHands.landmarks.length
 
@@ -752,16 +1226,61 @@ function loop(now) {
     }
     const intruderSustained = _intruderSince !== 0 && (now - _intruderSince) > 1000
 
-    if (!_captureActive && performance.now() > _captureCooldownUntil) {
-      const handTrigger = curHandCount > 0 && isLookingAtHand()
-      if (handTrigger || intruderSustained) {
-        _captureReason = handTrigger ? 'hand_visible_and_gaze_toward_wrist' : 'intruder_detected'
+    // window.__finalizing is set by the dashboard's End Session flow: once the
+    // session is being finalized, NO new incidents are allowed to start — the
+    // door is closed while incidents already in the pipeline finish. This is what
+    // lets the finalization gate ever reach queue_depth==0 (a fresh trigger would
+    // otherwise keep re-opening the queue).
+    if (!_captureActive && !window.__finalizing && performance.now() > _captureCooldownUntil) {
+      const handTrigger  = curHandCount > 0 && isLookingAtHand()
+      // Fire on a sustained sighting (streak) OR one HIGH-confidence sighting, so a
+      // brief phone that the detector only catches once still triggers a capture.
+      let   phoneTrigger = _phoneVisible && (_phoneStreak >= PHONE_FIRE_STREAK ||
+                           (_phoneScore >= PHONE_STRONG_SCORE && _phoneStreak >= 1))
+      // Same-spot debounce: a phone that never moves from a spot we already
+      // captured is almost certainly a FIXED object (e.g. a phone pictured on a
+      // poster) the LLM has judged — suppress repeat fires for a while. A phone
+      // that MOVES to a new position re-fires normally. Saves the LLM quota.
+      const pc = phoneCenterNow()
+      if (phoneTrigger && pc && _lastFiredPhoneCenter &&
+          (now - _lastFiredPhoneAt) < PHONE_SAME_SPOT_HOLD &&
+          Math.abs(pc.x - _lastFiredPhoneCenter.x) < PHONE_SAME_SPOT_TOL &&
+          Math.abs(pc.y - _lastFiredPhoneCenter.y) < PHONE_SAME_SPOT_TOL) {
+        phoneTrigger = false
+      }
+      const covertTrig  = covertTriggered(now)
+      const framingTrig = _framingHidden && (now - _framingFiredAt) > FRAMING_REARM_MS
+      if (phoneTrigger || intruderSustained || handTrigger || covertTrig || framingTrig) {
+        // Precedence: concrete signals first (visible phone, intruder), then the
+        // wrist-look heuristic, then the review-only behavioural signals (covert
+        // look-down, then framing/torso-hidden) which fire only if nothing
+        // concrete did.
+        _captureReason = phoneTrigger      ? 'phone_detected_realtime'
+                       : intruderSustained ? 'intruder_detected'
+                       : handTrigger       ? 'hand_visible_and_gaze_toward_wrist'
+                       : covertTrig        ? 'covert_device_suspected'
+                       :                     'framing_torso_hidden'
+        if (_captureReason === 'phone_detected_realtime' && pc) {
+          _lastFiredPhoneCenter = pc; _lastFiredPhoneAt = now   // remember this spot
+        }
+        if (_captureReason === 'covert_device_suspected') {
+          _covertGlances = []; _downStart = 0   // reset so it doesn't immediately re-fire
+        }
+        if (_captureReason === 'framing_torso_hidden') {
+          _framingFiredAt = now; _framingSince = 0; _framingHidden = false
+        }
+        if (_sig.events[_captureReason] != null) _sig.events[_captureReason]++   // Layer-1 event tally
         startCapture()
       }
     }
     _prevHandCount = curHandCount
 
     render(gs, _lastDetections, _lastHands, now)
+
+    // Layer 1 — log this frame's light signals into the continuous buffer. Runs
+    // AFTER render so it captures the state actually shown. Pure arithmetic +
+    // one tiny 32×18 frame-diff — it can never be why FPS drops.
+    logSignalFrame(now, gs, computeMotion())
   } catch (e) {
     console.error('[loop] error:', e)
   }

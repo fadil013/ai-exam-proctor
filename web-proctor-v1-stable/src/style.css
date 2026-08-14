@@ -191,8 +191,11 @@ html, body {
   box-shadow: 0 4px 14px rgba(220,38,38,.4);
   white-space: nowrap;
 }
-.feed-banner.face-ban  { background: #7c3aed; box-shadow: 0 4px 14px rgba(124,58,237,.4); }
-.feed-banner.phone-ban { background: #dc2626; box-shadow: 0 4px 14px rgba(220,38,38,.5); letter-spacing: 2px; }
+/* Banners stack upward so several can show at once without overlapping. */
+.feed-banner.face-ban   { background: #7c3aed; box-shadow: 0 4px 14px rgba(124,58,237,.4); bottom: 50px; }
+.feed-banner.phone-ban  { background: #dc2626; box-shadow: 0 4px 14px rgba(220,38,38,.5); letter-spacing: 2px; bottom: 88px; }
+.feed-banner.covert-ban { background: #d97706; box-shadow: 0 4px 14px rgba(217,119,6,.45); letter-spacing: 1px; bottom: 126px; }
+.feed-banner.framing-ban { background: #0891b2; box-shadow: 0 4px 14px rgba(8,145,178,.45); letter-spacing: 1px; bottom: 164px; }
 .feed-banner.hidden { display: none; }
 
 /* Stat cards */
@@ -429,6 +432,55 @@ html, body {
 }
 #error-box h2 { color: var(--red); margin-bottom: 12px; font-size: 18px; }
 #error-box p  { color: var(--ink); line-height: 1.6; white-space: pre-line; }
+
+/* ── Official (server-rendered) PDF button — premium indigo ──────────── */
+.official-pdf-btn, .end-session-btn.official-pdf-btn {
+  border: 1.5px solid transparent;
+  color: #fff;
+  background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
+  box-shadow: 0 2px 8px rgba(79, 70, 229, .28);
+  transition: background .14s, box-shadow .14s, transform .14s;
+}
+.official-pdf-btn:hover, .end-session-btn.official-pdf-btn:hover {
+  color: #fff;
+  background: linear-gradient(135deg, #4338ca 0%, #4f46e5 100%);
+  box-shadow: 0 5px 16px rgba(79, 70, 229, .42);
+  transform: translateY(-1px);
+}
+.official-pdf-btn:active, .end-session-btn.official-pdf-btn:active { transform: translateY(0); }
+
+/* ── Evidence strength badges ────────────────────────────────────────── */
+.rep-likelihood.ev-strong       { background: rgba(220,38,38,.15);  color: #dc2626; }
+.rep-likelihood.ev-moderate     { background: rgba(245,158,11,.15); color: #d97706; }
+.rep-likelihood.ev-weak         { background: rgba(59,130,246,.15); color: #2563eb; }
+.rep-likelihood.ev-inconclusive { background: rgba(107,114,128,.15);color: #6b7280; }
+
+/* ── Examiner review (human-in-the-loop) ─────────────────────────────── */
+.exam-box, .exam-done { display: block; }
+.exam-input {
+  width: 100%; margin: 6px 0; padding: 7px 9px; border-radius: 7px;
+  border: 1px solid var(--line, #2a2f3a); background: var(--panel, #12151c);
+  color: var(--ink, #e5e7eb); font-size: 13px; font-family: inherit;
+}
+.exam-note { min-height: 46px; resize: vertical; }
+.exam-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.exam-btn {
+  flex: 1 1 auto; min-width: 78px; padding: 7px 10px; border-radius: 7px;
+  border: 1px solid transparent; cursor: pointer; font-weight: 700; font-size: 12px;
+  color: #fff; transition: filter .12s;
+}
+.exam-btn:hover { filter: brightness(1.12); }
+.exam-btn.confirm { background: #dc2626; }
+.exam-btn.reject  { background: #10b981; }
+.exam-btn.incon   { background: #d97706; }
+.exam-btn.tech    { background: #6b7280; }
+.exam-tag { padding: 2px 8px; border-radius: 6px; }
+.exam-tag.exam-confirmed    { background: rgba(220,38,38,.15);  color: #dc2626; }
+.exam-tag.exam-rejected     { background: rgba(16,185,129,.15); color: #10b981; }
+.exam-tag.exam-inconclusive { background: rgba(217,119,6,.15);  color: #d97706; }
+.exam-tag.exam-technical    { background: rgba(107,114,128,.15);color: #6b7280; }
+.seal-hash { font-size: 11px; word-break: break-all; opacity: .75; }
+.contra-list li { color: #d97706; }
 
 /* ── Responsive trims for small laptops ──────────────────────────────── */
 @media (max-width: 1180px) {

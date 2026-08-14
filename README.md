@@ -7,42 +7,53 @@ A browser-based AI proctoring system that watches a candidate's webcam during an
 ```
 Browser (candidate)                         Go API server                    Cloud
 ─────────────────────                       ─────────────                    ─────
-webcam ─▶ ONNX models (in-browser)
-          • gaze / head pose  (RT-DETR)
-          • phone + person    (YOLOv8)
+webcam ─▶ MediaPipe Tasks (in-browser, CPU)
+          • gaze / head pose   (FaceLandmarker)
+          • hands              (HandLandmarker)
+          • 2nd person         (FaceDetector)
+          • phone              (ObjectDetector / EfficientDet-Lite0)
+          • covert / framing   (pure math)
               │
-              │ on suspicious event → POST incident (frames + signals)
+              │ on a triggered incident → POST 6 frames + signals
               ▼
         /incident  ──────────────▶  Go server
-                                     • dedupes + stores incident
-                                     • calls Groq or Gemini vision LLM
-                                       to write a human-readable report
+                                     • writes a PROVISIONAL verdict instantly
+                                     • enriches with a vision LLM (async, serial queue)
+                                     • decideVerdict() recomputes the verdict DETERMINISTICALLY
+                                     • append-only event log + replayable decision trace
                                      • persists to Supabase ───────────▶ Supabase (Postgres)
-                                                                          dashboard reads from here
+                                     • local-disk fallback ◀── dashboard reads session report
+              ▲
+   End Session → finalization gate (waits for queue quiescence) → locked snapshot → PDF
 ```
 
-- **Client-side detection** — `onnxruntime-web` runs RT-DETR (gaze/pose) and YOLOv8 (phone/person) in a Web Worker, so video never leaves the device until something is flagged.
-- **Incident reporting** — the Go backend forwards flagged frames to a vision LLM (**Groq** primary, **Gemini** fallback) which returns a structured, per-frame report.
-- **Persistence + dashboard** — incidents are written to **Supabase**; a live dashboard surfaces them in real time.
+- **Client-side detection** — MediaPipe Tasks (FaceLandmarker / HandLandmarker / FaceDetector / ObjectDetector) run **entirely on the CPU** in the browser, staggered so no frame runs two heavy models; video never leaves the device until something is flagged.
+- **Deterministic verdict** — the AI is an **observer only**: it supplies per-frame observations, and `decideVerdict()` recomputes the verdict from rules, so the model can neither hallucinate a conviction nor bury a real object.
+- **Incident reporting** — the Go backend forwards flagged frames to a vision LLM (**Groq** primary, **Gemini** fallback) which returns structured per-frame observations.
+- **Audit & replay** — every incident has an append-only `events.jsonl` and a stored `ReplayInput`/`DecisionTrace`; `GET /replay?id=` re-derives the verdict deterministically and proves it matches (forensic "why was I flagged?").
+- **Finalization** — End Session waits (backend-verified, with a quiescence window) until the AI queue is idle, then freezes a **locked snapshot**; the report is built only from that — reports show **COMPLETE or FAILED**, never "pending".
+- **Persistence + dashboard** — incidents are written to **Supabase** with a **local-disk fallback**; a live dashboard surfaces them in real time.
 
 ## Stack
 
-**Frontend:** Vanilla JS + Vite · `onnxruntime-web` (WebAssembly/SIMD) · Web Workers
+**Frontend (live):** Vanilla JS + Vite · **MediaPipe Tasks** (WASM, CPU delegate) · html2pdf
 **Backend:** Go (stdlib `net/http`, zero framework) · Groq + Gemini vision APIs · Supabase REST
-**Models:** RT-DETR-X, YOLOv8n (exported to ONNX)
+**Detectors:** FaceLandmarker, HandLandmarker, FaceDetector (BlazeFace), ObjectDetector (EfficientDet-Lite0)
 
 ## Repo layout
 
 | Path | What |
 |---|---|
-| `api-server/` | Go incident API — LLM calls, Supabase persistence (`main.go`) |
-| `api-server/supabase_schema.sql` | Postgres schema for the incidents table |
-| `web-proctor/` | Vite frontend — in-browser detection (`src/`) |
-| `proctor_lite.py` | Standalone Python proctor (single-file reference implementation) |
+| `web-proctor-v1-stable/` | **The live frontend** — MediaPipe in-browser detection (`src/main.js`, `gaze.js`, `dashboard.js`) |
+| `api-server/main.go` | Go incident API — deterministic verdict engine, LLM queue, event log, replay, Supabase |
+| `api-server/main_test.go` | Verdict/classifier/replay tests |
+| `api-server/supabase_schema.sql` | Postgres schema (idempotent, self-migrating) |
+| `web-proctor/` | ⚠️ **Legacy** experimental frontend (ONNX RT-DETR/YOLOv8) — superseded by `web-proctor-v1-stable/`, kept for reference |
+| `proctor_lite.py` | 🔒 Standalone Python desktop reference (RT-DETR-x + YOLO + MediaPipe) |
 
 ## Running it
 
-> **Model weights and `node_modules` are not committed** (they're large / regenerable). Export the ONNX models with `web-proctor/export_onnx.py` and place them under `web-proctor/public/`.
+> **Secrets** go in `api-server/.env` (copy from `.env.example`) — gitignored, never committed.
 
 **Backend:**
 ```bash
@@ -51,11 +62,11 @@ cp .env.example .env        # fill in Supabase + Groq/Gemini keys
 go run main.go              # serves on :8080
 ```
 
-**Frontend:**
+**Frontend (live):**
 ```bash
-cd web-proctor
+cd web-proctor-v1-stable
 npm install
-npm run dev                 # Vite dev server
+npm run dev                 # Vite dev server (MediaPipe models load from CDN)
 ```
 
 ## Security
